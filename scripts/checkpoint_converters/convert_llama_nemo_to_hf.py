@@ -19,7 +19,7 @@ from collections import OrderedDict
 import torch
 from lightning.pytorch import Trainer
 from omegaconf import open_dict
-from transformers import AutoModelForCausalLM, LlamaTokenizer, LlamaTokenizerFast, convert_slow_tokenizer
+from transformers import AutoModelForCausalLM, LlamaTokenizer, AutoTokenizer, LlamaTokenizerFast, convert_slow_tokenizer
 
 from nemo.collections.nlp.models.language_modeling.megatron_gpt_model import MegatronGPTModel
 from nemo.collections.nlp.parts.nlp_overrides import NLPDDPStrategy
@@ -57,6 +57,7 @@ This script can be used to 1) generate only the HF weights, or 2) generate an en
     However this option makes the conversion script significantly slower.
 """
 
+TEST_PROMPT = "NVIDIA is a"
 
 def get_args():
     parser = ArgumentParser()
@@ -109,7 +110,7 @@ def get_args():
     return args
 
 
-def convert(input_nemo_file, output_hf_file, precision=None, cpu_only=False) -> None:
+def convert(input_nemo_file, output_hf_file, precision=None, cpu_only=False, hf_tokenizer=None) -> None:
     """
     Convert NeMo weights to HF weights
     """
@@ -227,10 +228,20 @@ def convert(input_nemo_file, output_hf_file, precision=None, cpu_only=False) -> 
     final_ln_base_name = f'model.norm.weight'
     checkpoint[final_ln_base_name] = param_to_weights(final_ln_weight)
 
-    output_layer_weight = model.state_dict()[f'model.output_layer.weight']
-    output_layer_base_name = f'lm_head.weight'
-    checkpoint[output_layer_base_name] = param_to_weights(output_layer_weight)
+    if getattr(model_config, "share_embeddings_and_output_weights", False):
+        # tie_word_embeddings: True
+        logging.info("Tying embeddings: share_embeddings_and_output_weights is True")
+        output_layer_weight = model.state_dict()[f'model.embedding.word_embeddings.weight']
+        output_layer_base_name = f'lm_head.weight'
+        checkpoint[output_layer_base_name] = param_to_weights(output_layer_weight)
+    else:
+        # tie_word_embeddings: False
+        logging.info("NOT Tying embeddings: share_embeddings_and_output_weights is False")
+        output_layer_weight = model.state_dict()[f'model.output_layer.weight']
+        output_layer_base_name = f'lm_head.weight'
+        checkpoint[output_layer_base_name] = param_to_weights(output_layer_weight)
 
+        # state_dict[hf_output_layer_weight_name] = param_to_weights(ckpt[output_layer_base_name])
     os.makedirs(os.path.dirname(output_hf_file), exist_ok=True)
     torch.save(checkpoint, output_hf_file)
     logging.info(f"Weights saved to {output_hf_file}")
@@ -250,18 +261,21 @@ def replace_hf_weights_and_tokenizer(
         input_hf_path,
         local_files_only=True,
         torch_dtype=dtype,
+        ignore_mismatched_sizes=True
     )
     nemo_exported = torch.load(weights_file)
 
     if tokenizer_path:
         try:
-            tokenizer = LlamaTokenizer.from_pretrained(
-                tokenizer_path,
-                local_files_only=True,
-                legacy=False,
-            )
-            tmp_tokenizer = convert_slow_tokenizer.convert_slow_tokenizer(tokenizer)
-            fast_tokenizer = LlamaTokenizerFast(tokenizer_object=tmp_tokenizer)
+            # tokenizer = LlamaTokenizer.from_pretrained(
+            #     tokenizer_path,
+            #     local_files_only=True,
+            #     legacy=False,
+            # )
+            # tmp_tokenizer = convert_slow_tokenizer.convert_slow_tokenizer(tokenizer)
+            # fast_tokenizer = LlamaTokenizerFast(tokenizer_object=tmp_tokenizer)
+            fast_tokenizer = AutoTokenizer.from_pretrained(tokenizer_path)
+            tokenizer = fast_tokenizer
             tokenizer_length = len(fast_tokenizer)
             model.resize_token_embeddings(tokenizer_length)
         except:
@@ -273,16 +287,33 @@ def replace_hf_weights_and_tokenizer(
     logging.info(f"Full HF model saved to {output_hf_path}")
 
     if tokenizer_path and (tokenizer is not None):
-        fast_tokenizer.save_pretrained(output_hf_tokenizer)
+        # fast_tokenizer.save_pretrained(output_hf_tokenizer)
         tokenizer.save_pretrained(output_hf_tokenizer)
         logging.info(f"Tokenizer saved to {output_hf_tokenizer}")
+
+    # Test model
+    logging.info(f"************\nTesting model stored at '{output_hf_path}'")
+    model = AutoModelForCausalLM.from_pretrained(
+        output_hf_path,
+        local_files_only=True,
+        torch_dtype=dtype,
+    )
+    tokenizer = AutoTokenizer.from_pretrained(output_hf_path, local_files_only=True)
+    inputs = tokenizer(TEST_PROMPT, return_tensors="pt")
+
+    # Generate text
+    outputs = model.generate(**inputs, max_length=50)
+    generated_text = tokenizer.decode(outputs[0], skip_special_tokens=True)
+
+    logging.info(f"Test prompt: {TEST_PROMPT}")
+    logging.info(f"Test generation: {generated_text}")
 
 
 if __name__ == '__main__':
     args = get_args()
     if not args.hf_output_tokenizer and args.hf_output_path:
         args.hf_output_tokenizer = args.hf_output_path
-    dtype = convert(args.input_name_or_path, args.output_path, precision=args.precision, cpu_only=args.cpu_only)
+    dtype = convert(args.input_name_or_path, args.output_path, precision=args.precision, cpu_only=args.cpu_only, hf_tokenizer=args.input_tokenizer)
     if args.hf_input_path and args.hf_output_path:
         replace_hf_weights_and_tokenizer(
             args.output_path,

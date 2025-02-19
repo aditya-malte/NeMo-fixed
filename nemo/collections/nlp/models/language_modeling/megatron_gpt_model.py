@@ -1855,7 +1855,7 @@ class MegatronGPTModel(MegatronBaseModel, TextGeneration):
     def generate(
         self,
         inputs: Union[List[str], torch.Tensor, List[dict]],
-        length_params: LengthParam,
+        length_params: LengthParam = None,
         sampling_params: SamplingParam = None,
         *,
         strategy: Optional[TextGenerationStrategy] = None,
