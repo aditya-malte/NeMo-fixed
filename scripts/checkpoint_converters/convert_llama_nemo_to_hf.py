@@ -19,7 +19,7 @@ from collections import OrderedDict
 import torch
 from lightning.pytorch import Trainer
 from omegaconf import open_dict
-from transformers import AutoModelForCausalLM, LlamaTokenizer, AutoTokenizer, LlamaTokenizerFast, convert_slow_tokenizer
+from transformers import AutoModelForCausalLM, LlamaTokenizer, LlamaTokenizerFast, convert_slow_tokenizer, AutoConfig, AutoTokenizer, GenerationConfig
 
 from nemo.collections.nlp.models.language_modeling.megatron_gpt_model import MegatronGPTModel
 from nemo.collections.nlp.parts.nlp_overrides import NLPDDPStrategy
@@ -57,7 +57,7 @@ This script can be used to 1) generate only the HF weights, or 2) generate an en
     However this option makes the conversion script significantly slower.
 """
 
-TEST_PROMPT = "NVIDIA is a"
+TEST_PROMPT = "Once upon a time,"
 
 def get_args():
     parser = ArgumentParser()
@@ -74,6 +74,11 @@ def get_args():
         type=str,
         default=None,
         help="A HF model path, " "e.g. a folder containing https://huggingface.co/meta-llama/Llama-2-7b-hf/tree/main",
+    )
+    parser.add_argument(
+        "--load_from_hf_config",
+        action="store_true",
+        help="Set this to True if you want only the config to be loaded and not the weights. Useful in situations where you are only interested in parts of the HF folder other than the weights",
     )
     parser.add_argument(
         "--hf_output_path",
@@ -110,7 +115,7 @@ def get_args():
     return args
 
 
-def convert(input_nemo_file, output_hf_file, precision=None, cpu_only=False, hf_tokenizer=None) -> None:
+def convert(input_nemo_file, output_hf_file, precision=None, cpu_only=False) -> None:
     """
     Convert NeMo weights to HF weights
     """
@@ -230,10 +235,10 @@ def convert(input_nemo_file, output_hf_file, precision=None, cpu_only=False, hf_
 
     if getattr(model_config, "share_embeddings_and_output_weights", False):
         # tie_word_embeddings: True
-        logging.info("Tying embeddings: share_embeddings_and_output_weights is True")
+        logging.info("Tied embeddings: share_embeddings_and_output_weights is True")
         output_layer_weight = model.state_dict()[f'model.embedding.word_embeddings.weight']
         output_layer_base_name = f'lm_head.weight'
-        checkpoint[output_layer_base_name] = param_to_weights(output_layer_weight)
+        checkpoint[output_layer_base_name] = checkpoint[embed_weights_base_name]
     else:
         # tie_word_embeddings: False
         logging.info("NOT Tying embeddings: share_embeddings_and_output_weights is False")
@@ -241,7 +246,6 @@ def convert(input_nemo_file, output_hf_file, precision=None, cpu_only=False, hf_
         output_layer_base_name = f'lm_head.weight'
         checkpoint[output_layer_base_name] = param_to_weights(output_layer_weight)
 
-        # state_dict[hf_output_layer_weight_name] = param_to_weights(ckpt[output_layer_base_name])
     os.makedirs(os.path.dirname(output_hf_file), exist_ok=True)
     torch.save(checkpoint, output_hf_file)
     logging.info(f"Weights saved to {output_hf_file}")
@@ -256,13 +260,28 @@ def replace_hf_weights_and_tokenizer(
     output_hf_path,
     tokenizer_path,
     output_hf_tokenizer,
+    load_from_hf_config=False
 ):
-    model = AutoModelForCausalLM.from_pretrained(
-        input_hf_path,
-        local_files_only=True,
-        torch_dtype=dtype,
-        ignore_mismatched_sizes=True
-    )
+    
+    if load_from_hf_config:
+        hf_config = AutoConfig.from_pretrained(input_hf_path)
+        model = AutoModelForCausalLM.from_config(
+            hf_config,
+        )
+        logging.warning(f"Loading model ONLY from HF config inside HF path: {input_hf_path} as load_from_hf_config:{load_from_hf_config}")
+    else:
+        model = AutoModelForCausalLM.from_pretrained(
+            input_hf_path,
+            local_files_only=True,
+            torch_dtype=dtype,
+        )
+    try:
+        if(input_hf_path):
+            generation_config = GenerationConfig.from_pretrained(input_hf_path)
+            model.generation_config = generation_config
+    except:
+        logging.info("Skipped loading generation config")
+
     nemo_exported = torch.load(weights_file)
 
     if tokenizer_path:
@@ -274,6 +293,8 @@ def replace_hf_weights_and_tokenizer(
             # )
             # tmp_tokenizer = convert_slow_tokenizer.convert_slow_tokenizer(tokenizer)
             # fast_tokenizer = LlamaTokenizerFast(tokenizer_object=tmp_tokenizer)
+            # tokenizer_length = len(fast_tokenizer)
+            # model.resize_token_embeddings(tokenizer_length)
             fast_tokenizer = AutoTokenizer.from_pretrained(tokenizer_path)
             tokenizer = fast_tokenizer
             tokenizer_length = len(fast_tokenizer)
@@ -287,33 +308,50 @@ def replace_hf_weights_and_tokenizer(
     logging.info(f"Full HF model saved to {output_hf_path}")
 
     if tokenizer_path and (tokenizer is not None):
-        # fast_tokenizer.save_pretrained(output_hf_tokenizer)
+        fast_tokenizer.save_pretrained(output_hf_tokenizer)
         tokenizer.save_pretrained(output_hf_tokenizer)
         logging.info(f"Tokenizer saved to {output_hf_tokenizer}")
 
-    # Test model
-    logging.info(f"************\nTesting model stored at '{output_hf_path}'")
-    model = AutoModelForCausalLM.from_pretrained(
-        output_hf_path,
-        local_files_only=True,
-        torch_dtype=dtype,
-    )
-    tokenizer = AutoTokenizer.from_pretrained(output_hf_path, local_files_only=True)
-    inputs = tokenizer(TEST_PROMPT, return_tensors="pt")
+    # Test final generated HF directory if HF tokenizer specified
+    if tokenizer_path:
+        logging.info(f"************\nTesting final model and tokenizer created at HF directory: `{output_hf_path}`")
+        try:
+            # tokenizer = LlamaTokenizer.from_pretrained(
+            #     output_hf_path,
+            #     local_files_only=True,
+            #     legacy=False,
+            # )
+            # tmp_tokenizer = convert_slow_tokenizer.convert_slow_tokenizer(tokenizer)
+            # fast_tokenizer = LlamaTokenizerFast(tokenizer_object=tmp_tokenizer)
+            # tokenizer_length = len(fast_tokenizer)
+            # model.resize_token_embeddings(tokenizer_length)
+            fast_tokenizer = AutoTokenizer.from_pretrained(output_hf_path)
+            tokenizer = fast_tokenizer
+            tokenizer_length = len(fast_tokenizer)
+            model.resize_token_embeddings(tokenizer_length)
+        except Exception as e:
+            tokenizer = None
+            logging.warning(f"Could not load custom tokenizer, proceeding with default tokenizer:\n{e}")
 
-    # Generate text
-    outputs = model.generate(**inputs, max_length=50)
-    generated_text = tokenizer.decode(outputs[0], skip_special_tokens=True)
+        model = AutoModelForCausalLM.from_pretrained(
+            output_hf_path,
+            local_files_only=True,
+            torch_dtype=dtype,
+        )
+        inputs = tokenizer(TEST_PROMPT, return_tensors="pt")
 
-    logging.info(f"Test prompt: {TEST_PROMPT}")
-    logging.info(f"Test generation: {generated_text}")
+        outputs = model.generate(**inputs, max_length=50)
+        generated_text = tokenizer.decode(outputs[0], skip_special_tokens=True)
+
+        logging.info(f"Test prompt: {TEST_PROMPT}")
+        logging.info(f"Test generation: {generated_text}")
 
 
 if __name__ == '__main__':
     args = get_args()
     if not args.hf_output_tokenizer and args.hf_output_path:
         args.hf_output_tokenizer = args.hf_output_path
-    dtype = convert(args.input_name_or_path, args.output_path, precision=args.precision, cpu_only=args.cpu_only, hf_tokenizer=args.input_tokenizer)
+    dtype = convert(args.input_name_or_path, args.output_path, precision=args.precision, cpu_only=args.cpu_only)
     if args.hf_input_path and args.hf_output_path:
         replace_hf_weights_and_tokenizer(
             args.output_path,
@@ -322,6 +360,7 @@ if __name__ == '__main__':
             args.hf_output_path,
             args.input_tokenizer,
             args.hf_output_tokenizer,
+            args.load_from_hf_config
         )
     else:
         logging.info("`hf_input_path` and/or `hf_output_path` not provided, not generating full HF model.")
