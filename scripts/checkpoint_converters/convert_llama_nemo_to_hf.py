@@ -269,18 +269,18 @@ def replace_hf_weights_and_tokenizer(
             hf_config,
         )
         logging.warning(f"Loading model ONLY from HF config inside HF path: {input_hf_path} as load_from_hf_config:{load_from_hf_config}")
+        try:
+            if(input_hf_path):
+                generation_config = GenerationConfig.from_pretrained(input_hf_path)
+                model.generation_config = generation_config
+        except:
+            logging.info("Skipped loading generation config")
     else:
         model = AutoModelForCausalLM.from_pretrained(
             input_hf_path,
             local_files_only=True,
             torch_dtype=dtype,
         )
-    try:
-        if(input_hf_path):
-            generation_config = GenerationConfig.from_pretrained(input_hf_path)
-            model.generation_config = generation_config
-    except:
-        logging.info("Skipped loading generation config")
 
     nemo_exported = torch.load(weights_file)
 
